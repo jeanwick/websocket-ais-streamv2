@@ -7,7 +7,6 @@ const PORT = process.env.PORT || 3015;
 
 let shipsData = [];
 let ws = null; // Track the WebSocket instance
-// let currentBoundingBox = [[-25.7205, 32.8762], [-25.9626, 32.0822]]; // Default bounding box (Durban)
 let currentBoundingBox = [[-38.88, 31.03], [-20.88, 42.74]];
 
 app.use(cors());
@@ -25,7 +24,7 @@ function connectAISStream() {
     console.log('WebSocket connection opened.');
     const subscriptionMessage = {
       APIKey: 'd19b998ef294b9e5e4889c8df050742eddf303bc',
-      BoundingBoxes: [currentBoundingBox], // Use the dynamic bounding box
+      BoundingBoxes: [currentBoundingBox],
       FilterMessageTypes: ['PositionReport'],
     };
 
@@ -33,7 +32,7 @@ function connectAISStream() {
   };
 
   ws.onmessage = (message) => {
-    const data = JSON.parse(message.data.toString()); // Decode the buffer to a string and parse as JSON
+    const data = JSON.parse(message.data.toString());
     console.log('Message received from AIS stream:', data);
   
     if (data.Message && data.Message.PositionReport) {
@@ -46,7 +45,6 @@ function connectAISStream() {
         timestamp: data.MetaData.time_utc,  // Add timestamp
       };
   
-      // Add or update ships data
       const existingIndex = shipsData.findIndex((ship) => ship.mmsi === shipData.mmsi);
       if (existingIndex !== -1) {
         shipsData[existingIndex] = shipData;
@@ -58,7 +56,7 @@ function connectAISStream() {
 
   ws.onclose = () => {
     console.log('WebSocket connection closed');
-    setTimeout(connectAISStream, 1000); // Reconnect after 1 second
+    setTimeout(connectAISStream, 1000);
   };
 
   ws.onerror = (err) => {
@@ -69,25 +67,16 @@ function connectAISStream() {
 // Initial WebSocket connection
 connectAISStream();
 
-// Enable CORS (for frontend connection)
-app.use(cors());
+// Periodically save ship data every 2 hours
+setInterval(() => {
+  console.log('Saving ship data to memory every 2 hours');
+  // Since we're keeping the data in-memory, no need for further action here
+  // You could optionally log or persist it to a database
+}, 7200000); // 2 hours = 7200000 ms
 
-// API endpoint to serve ship data to frontend
+// API endpoint to serve ship data to frontend or external service
 app.get('/api/ships', (req, res) => {
   res.json(shipsData);
-});
-
-// New endpoint to update the bounding box
-app.post('/api/update-bounding-box', (req, res) => {
-  const { boundingBox } = req.body;
-  if (boundingBox && Array.isArray(boundingBox) && boundingBox.length === 2) {
-    console.log('Received new bounding box:', boundingBox);
-    currentBoundingBox = boundingBox; // Update the current bounding box
-    connectAISStream(); // Reconnect WebSocket with new bounding box
-    res.status(200).json({ message: 'Bounding box updated and WebSocket reconnected.' });
-  } else {
-    res.status(400).json({ error: 'Invalid bounding box format.' });
-  }
 });
 
 // Start the Express server
