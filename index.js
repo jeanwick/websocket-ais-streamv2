@@ -42,7 +42,7 @@ function connectAISStream() {
         lon: data.Message.PositionReport.Longitude,
         speed: data.Message.PositionReport.Sog || 0,
         course: data.Message.PositionReport.Cog || 0,
-        timestamp: data.MetaData.time_utc,  // Add timestamp
+        timestamp: data.MetaData.time_utc,  // Added timestamp
       };
 
       // Update existing ship data or add new ship data
