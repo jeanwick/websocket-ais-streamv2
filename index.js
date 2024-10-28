@@ -1,13 +1,31 @@
 const express = require('express');
 const WebSocket = require('ws');
 const cors = require('cors');
+const fs = require('fs'); // Import the fs module
+const SHIPS_DATA_FILE = 'shipsData.json'; // Define a constant for the file name
 
 const app = express();
 const PORT = process.env.PORT || 3015;
 
-let shipsData = []; // Data persists across WebSocket reconnections
+let shipsData = [];
+
+// Load shipsData from file if it exists
+if (fs.existsSync(SHIPS_DATA_FILE)) {
+  try {
+    const data = fs.readFileSync(SHIPS_DATA_FILE, 'utf8');
+    shipsData = JSON.parse(data);
+    console.log('Loaded shipsData from file.');
+  } catch (err) {
+    console.error('Error reading shipsData from file:', err);
+  }
+}
+
 let ws = null;
-let currentBoundingBox = [[-38.88, 31.03], [-20.88, 42.74]];
+let currentBoundingBox = [
+  [-38.88, 31.03], [-20.88, 42.74],  // Durban (but big)
+  [[-33.895056, 18.410718], [-34.013399, 18.452209]], // Cape Town
+  [[-34.017609, 25.612232], [-33.964904, 25.689558]] // Port Elizabeth
+];
 
 let connectionState = {
   lastConnectionTimestamp: null,  // Track the last successful WebSocket connection
@@ -60,6 +78,13 @@ function connectAISStream() {
       } else {
         shipsData.push(shipData);  // Add new ship
       }
+
+      // Write shipsData to file
+      fs.writeFile(SHIPS_DATA_FILE, JSON.stringify(shipsData), (err) => {
+        if (err) {
+          console.error('Error writing shipsData to file:', err);
+        }
+      });
     }
   };
 
@@ -80,6 +105,17 @@ connectAISStream();
 
 // API endpoint to serve ship data to external services
 app.get('/api/ships', (req, res) => {
+  // If shipsData is empty, try to load it from the file
+  if (!shipsData.length && fs.existsSync(SHIPS_DATA_FILE)) {
+    try {
+      const data = fs.readFileSync(SHIPS_DATA_FILE, 'utf8');
+      shipsData = JSON.parse(data);
+      console.log('Loaded shipsData from file in API endpoint.');
+    } catch (err) {
+      console.error('Error reading shipsData from file in API endpoint:', err);
+    }
+  }
+
   const response = {
     data: shipsData,
     isConnected: connectionState.isConnected,
