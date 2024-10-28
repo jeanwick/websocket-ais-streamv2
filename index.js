@@ -3,7 +3,6 @@
 const express = require('express');
 const WebSocket = require('ws');
 const cors = require('cors');
-const { put, get } = require('@vercel/blob');
 require('dotenv').config(); // To load environment variables from .env
 
 const app = express();
@@ -29,17 +28,22 @@ app.use(express.json()); // To parse JSON bodies
 // Load shipsData from Blob storage if it exists
 async function loadShipsData() {
   try {
-    const response = await get('shipsData.json', {
-      token: process.env.VERCEL_BLOB_READ_WRITE_TOKEN,
+    const response = await fetch('https://blob.vercel-storage.com/shipsData.json', {
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${process.env.VERCEL_BLOB_READ_WRITE_TOKEN}`,
+      },
     });
 
-    if (response && response.body) {
-      let data = '';
-      for await (const chunk of response.body) {
-        data += chunk.toString();
-      }
-      shipsData = JSON.parse(data);
+    if (response.ok) {
+      const data = await response.json();
+      shipsData = data;
       console.log('Loaded shipsData from Blob storage.');
+    } else if (response.status === 404) {
+      console.log('shipsData.json not found in Blob storage. Starting with empty data.');
+      shipsData = [];
+    } else {
+      throw new Error(`Failed to fetch shipsData.json: ${response.statusText}`);
     }
   } catch (err) {
     console.error('Error reading shipsData from Blob storage:', err);
@@ -96,12 +100,21 @@ function connectAISStream() {
       // Write shipsData to Blob storage
       (async () => {
         try {
-          await put('shipsData.json', JSON.stringify(shipsData), {
-            token: process.env.VERCEL_BLOB_READ_WRITE_TOKEN,
-            access: 'public',
-            contentType: 'application/json',
+          const response = await fetch('https://blob.vercel-storage.com/shipsData.json', {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${process.env.VERCEL_BLOB_READ_WRITE_TOKEN}`,
+              'Content-Type': 'application/json',
+              'x-vercel-blob-access': 'public',
+            },
+            body: JSON.stringify(shipsData),
           });
-          console.log('shipsData updated in Blob storage');
+
+          if (response.ok) {
+            console.log('shipsData updated in Blob storage');
+          } else {
+            throw new Error(`Failed to update shipsData.json: ${response.statusText}`);
+          }
         } catch (err) {
           console.error('Error writing shipsData to Blob storage:', err);
         }
@@ -128,22 +141,7 @@ connectAISStream();
 app.get('/api/ships', async (req, res) => {
   // If shipsData is empty, try to load it from Blob storage
   if (!shipsData.length) {
-    try {
-      const response = await get('shipsData.json', {
-        token: process.env.VERCEL_BLOB_READ_WRITE_TOKEN,
-      });
-
-      if (response && response.body) {
-        let data = '';
-        for await (const chunk of response.body) {
-          data += chunk.toString();
-        }
-        shipsData = JSON.parse(data);
-        console.log('Loaded shipsData from Blob storage in API endpoint.');
-      }
-    } catch (err) {
-      console.error('Error reading shipsData from Blob storage in API endpoint:', err);
-    }
+    await loadShipsData();
   }
 
   const responsePayload = {
