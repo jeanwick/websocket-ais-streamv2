@@ -1,30 +1,21 @@
+// index.js
+
 const express = require('express');
 const WebSocket = require('ws');
 const cors = require('cors');
-const fs = require('fs'); // Import the fs module
-const SHIPS_DATA_FILE = 'shipsData.json'; // Define a constant for the file name
+const { put, get } = require('@vercel/blob');
+require('dotenv').config(); // To load environment variables from .env
 
 const app = express();
 const PORT = process.env.PORT || 3015;
 
 let shipsData = [];
 
-// Load shipsData from file if it exists
-if (fs.existsSync(SHIPS_DATA_FILE)) {
-  try {
-    const data = fs.readFileSync(SHIPS_DATA_FILE, 'utf8');
-    shipsData = JSON.parse(data);
-    console.log('Loaded shipsData from file.');
-  } catch (err) {
-    console.error('Error reading shipsData from file:', err);
-  }
-}
-
 let ws = null;
 let currentBoundingBox = [
   [-38.88, 31.03], [-20.88, 42.74],  // Durban (but big)
   [[-33.895056, 18.410718], [-34.013399, 18.452209]], // Cape Town
-  [[-34.017609, 25.612232], [-33.964904, 25.689558]] // Port Elizabeth
+  [[-34.017609, 25.612232], [-33.964904, 25.689558]]  // Port Elizabeth
 ];
 
 let connectionState = {
@@ -34,6 +25,29 @@ let connectionState = {
 
 app.use(cors());
 app.use(express.json()); // To parse JSON bodies
+
+// Load shipsData from Blob storage if it exists
+async function loadShipsData() {
+  try {
+    const response = await get('shipsData.json', {
+      token: process.env.VERCEL_BLOB_READ_WRITE_TOKEN,
+    });
+
+    if (response && response.body) {
+      let data = '';
+      for await (const chunk of response.body) {
+        data += chunk.toString();
+      }
+      shipsData = JSON.parse(data);
+      console.log('Loaded shipsData from Blob storage.');
+    }
+  } catch (err) {
+    console.error('Error reading shipsData from Blob storage:', err);
+  }
+}
+
+// Call loadShipsData at startup
+loadShipsData();
 
 // WebSocket connection to AIS stream
 function connectAISStream() {
@@ -49,7 +63,7 @@ function connectAISStream() {
     connectionState.lastConnectionTimestamp = new Date().toISOString();  // Record connection time
 
     const subscriptionMessage = {
-      APIKey: 'd19b998ef294b9e5e4889c8df050742eddf303bc',
+      APIKey: 'd19b998ef294b9e5e4889c8df050742eddf303bc', // Your API Key
       BoundingBoxes: [currentBoundingBox], // Use the dynamic bounding box
       FilterMessageTypes: ['PositionReport'],
     };
@@ -79,12 +93,19 @@ function connectAISStream() {
         shipsData.push(shipData);  // Add new ship
       }
 
-      // Write shipsData to file
-      fs.writeFile(SHIPS_DATA_FILE, JSON.stringify(shipsData), (err) => {
-        if (err) {
-          console.error('Error writing shipsData to file:', err);
+      // Write shipsData to Blob storage
+      (async () => {
+        try {
+          await put('shipsData.json', JSON.stringify(shipsData), {
+            token: process.env.VERCEL_BLOB_READ_WRITE_TOKEN,
+            access: 'public',
+            contentType: 'application/json',
+          });
+          console.log('shipsData updated in Blob storage');
+        } catch (err) {
+          console.error('Error writing shipsData to Blob storage:', err);
         }
-      });
+      })();
     }
   };
 
@@ -104,19 +125,28 @@ function connectAISStream() {
 connectAISStream();
 
 // API endpoint to serve ship data to external services
-app.get('/api/ships', (req, res) => {
-  // If shipsData is empty, try to load it from the file
-  if (!shipsData.length && fs.existsSync(SHIPS_DATA_FILE)) {
+app.get('/api/ships', async (req, res) => {
+  // If shipsData is empty, try to load it from Blob storage
+  if (!shipsData.length) {
     try {
-      const data = fs.readFileSync(SHIPS_DATA_FILE, 'utf8');
-      shipsData = JSON.parse(data);
-      console.log('Loaded shipsData from file in API endpoint.');
+      const response = await get('shipsData.json', {
+        token: process.env.VERCEL_BLOB_READ_WRITE_TOKEN,
+      });
+
+      if (response && response.body) {
+        let data = '';
+        for await (const chunk of response.body) {
+          data += chunk.toString();
+        }
+        shipsData = JSON.parse(data);
+        console.log('Loaded shipsData from Blob storage in API endpoint.');
+      }
     } catch (err) {
-      console.error('Error reading shipsData from file in API endpoint:', err);
+      console.error('Error reading shipsData from Blob storage in API endpoint:', err);
     }
   }
 
-  const response = {
+  const responsePayload = {
     data: shipsData,
     isConnected: connectionState.isConnected,
     lastConnectionTimestamp: connectionState.lastConnectionTimestamp,
@@ -126,10 +156,10 @@ app.get('/api/ships', (req, res) => {
     console.log(`Connection down, serving data from: ${connectionState.lastConnectionTimestamp}`);
     res.status(200).json({
       message: `Connection is down, showing last known data from ${connectionState.lastConnectionTimestamp}`,
-      ...response
+      ...responsePayload
     });
   } else {
-    res.status(200).json(response); // Send live data if connected
+    res.status(200).json(responsePayload); // Send live data if connected
   }
 });
 

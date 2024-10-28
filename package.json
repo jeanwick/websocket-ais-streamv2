@@ -1,15 +1,16 @@
 {
   "name": "websocket-ais-streamv2",
   "version": "1.0.0",
-  "description": "",
+  "description": "AIS Stream Server with Vercel Blob Storage",
   "main": "index.js",
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.7.7",
+    "@vercel/blob": "^0.1.0",
     "cors": "^2.8.5",
-    "express": "^4.17.1",
-    "ws": "^7.4.5"
+    "dotenv": "^16.0.3",
+    "express": "^4.18.2",
+    "ws": "^8.11.0"
   }
 }
