@@ -1,9 +1,10 @@
 // index.js
 
+require('dotenv').config(); // Load environment variables at the very top
+
 const express = require('express');
 const WebSocket = require('ws');
 const cors = require('cors');
-require('dotenv').config(); // To load environment variables from .env
 
 const app = express();
 const PORT = process.env.PORT || 3015;
@@ -12,7 +13,7 @@ let shipsData = [];
 
 let ws = null;
 let currentBoundingBox = [
-  [-38.88, 31.03], [-20.88, 42.74],  // Durban (but big)
+  [-38.88, 31.03], [-20.88, 42.74],  // Durban area
   [[-33.895056, 18.410718], [-34.013399, 18.452209]], // Cape Town
   [[-34.017609, 25.612232], [-33.964904, 25.689558]]  // Port Elizabeth
 ];
@@ -67,7 +68,7 @@ function connectAISStream() {
     connectionState.lastConnectionTimestamp = new Date().toISOString();  // Record connection time
 
     const subscriptionMessage = {
-      APIKey: 'd19b998ef294b9e5e4889c8df050742eddf303bc', // Your API Key
+      APIKey: process.env.AIS_API_KEY, // Use your AIS API Key from environment variable
       BoundingBoxes: [currentBoundingBox], // Use the dynamic bounding box
       FilterMessageTypes: ['PositionReport'],
     };
@@ -137,28 +138,100 @@ function connectAISStream() {
 // Initial WebSocket connection
 connectAISStream();
 
-// API endpoint to serve ship data to external services
+// API endpoint to serve ship data to external services with query parameters
 app.get('/api/ships', async (req, res) => {
-  // If shipsData is empty, try to load it from Blob storage
+  // Extract query parameters
+  const {
+    mmsi,
+    latMin,
+    latMax,
+    lonMin,
+    lonMax,
+    speedMin,
+    speedMax,
+    courseMin,
+    courseMax,
+    timestampMin,
+    timestampMax,
+    page = 1,
+    limit = 100,
+  } = req.query;
+
+  // Load data if necessary
   if (!shipsData.length) {
     await loadShipsData();
   }
 
+  let filteredData = shipsData;
+
+  // Filter by MMSI
+  if (mmsi) {
+    filteredData = filteredData.filter(ship => ship.mmsi.toString() === mmsi);
+  }
+
+  // Filter by geographical area
+  if (latMin && latMax && lonMin && lonMax) {
+    filteredData = filteredData.filter(ship => {
+      return (
+        ship.lat >= parseFloat(latMin) &&
+        ship.lat <= parseFloat(latMax) &&
+        ship.lon >= parseFloat(lonMin) &&
+        ship.lon <= parseFloat(lonMax)
+      );
+    });
+  }
+
+  // Filter by speed range
+  if (speedMin && speedMax) {
+    filteredData = filteredData.filter(ship => {
+      return (
+        ship.speed >= parseFloat(speedMin) &&
+        ship.speed <= parseFloat(speedMax)
+      );
+    });
+  }
+
+  // Filter by course range
+  if (courseMin && courseMax) {
+    filteredData = filteredData.filter(ship => {
+      return (
+        ship.course >= parseFloat(courseMin) &&
+        ship.course <= parseFloat(courseMax)
+      );
+    });
+  }
+
+  // Filter by timestamp range
+  if (timestampMin && timestampMax) {
+    const timestampMinDate = new Date(timestampMin);
+    const timestampMaxDate = new Date(timestampMax);
+    filteredData = filteredData.filter(ship => {
+      const shipTimestamp = new Date(ship.timestamp);
+      return (
+        shipTimestamp >= timestampMinDate &&
+        shipTimestamp <= timestampMaxDate
+      );
+    });
+  }
+
+  // Implement pagination
+  const pageInt = parseInt(page);
+  const limitInt = parseInt(limit);
+  const startIndex = (pageInt - 1) * limitInt;
+  const endIndex = pageInt * limitInt;
+  const paginatedData = filteredData.slice(startIndex, endIndex);
+
+  // Prepare the response
   const responsePayload = {
-    data: shipsData,
+    data: paginatedData,
     isConnected: connectionState.isConnected,
     lastConnectionTimestamp: connectionState.lastConnectionTimestamp,
+    totalResults: filteredData.length,
+    currentPage: pageInt,
+    totalPages: Math.ceil(filteredData.length / limitInt),
   };
 
-  if (!connectionState.isConnected) {
-    console.log(`Connection down, serving data from: ${connectionState.lastConnectionTimestamp}`);
-    res.status(200).json({
-      message: `Connection is down, showing last known data from ${connectionState.lastConnectionTimestamp}`,
-      ...responsePayload
-    });
-  } else {
-    res.status(200).json(responsePayload); // Send live data if connected
-  }
+  res.status(200).json(responsePayload);
 });
 
 // Start the Express server
