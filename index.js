@@ -6,53 +6,58 @@ const express = require('express');
 const WebSocket = require('ws');
 const cors = require('cors');
 
+const { sql } = require('@vercel/postgres'); // Use the sql function
+
 const app = express();
 const PORT = process.env.PORT || 3015;
 
-let shipsData = [];
-
 let ws = null;
-let currentBoundingBox = [
+const currentBoundingBox = [
   [-38.88, 31.03], [-20.88, 42.74],  // Durban area
   [[-33.895056, 18.410718], [-34.013399, 18.452209]], // Cape Town
   [[-34.017609, 25.612232], [-33.964904, 25.689558]]  // Port Elizabeth
 ];
 
 let connectionState = {
-  lastConnectionTimestamp: null,  // Track the last successful WebSocket connection
-  isConnected: false              // Indicates whether the WebSocket is currently connected
+  lastConnectionTimestamp: null,
+  isConnected: false
 };
 
 app.use(cors());
-app.use(express.json()); // To parse JSON bodies
+app.use(express.json());
 
-// Load shipsData from Blob storage if it exists
-async function loadShipsData() {
+// In-memory cache for ship data
+const shipDataCache = new Map();
+
+// Initialize database and create indexes
+async function initializeDatabase() {
   try {
-    const response = await fetch('https://blob.vercel-storage.com/shipsData.json', {
-      method: 'GET',
-      headers: {
-        'Authorization': `Bearer ${process.env.VERCEL_BLOB_READ_WRITE_TOKEN}`,
-      },
-    });
+    console.log('Initializing database...');
 
-    if (response.ok) {
-      const data = await response.json();
-      shipsData = data;
-      console.log('Loaded shipsData from Blob storage.');
-    } else if (response.status === 404) {
-      console.log('shipsData.json not found in Blob storage. Starting with empty data.');
-      shipsData = [];
-    } else {
-      throw new Error(`Failed to fetch shipsData.json: ${response.statusText}`);
-    }
+    await sql`
+      CREATE TABLE IF NOT EXISTS ships (
+        mmsi VARCHAR(9) PRIMARY KEY,
+        lat NUMERIC(9,6),
+        lon NUMERIC(9,6),
+        speed REAL,
+        course REAL,
+        timestamp TIMESTAMP
+      )
+    `;
+    console.log('Ships table is ready.');
+
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_ships_mmsi ON ships (mmsi)
+    `;
+    await sql`
+      CREATE INDEX IF NOT EXISTS idx_ships_timestamp ON ships (timestamp)
+    `;
+    console.log('Indexes created.');
   } catch (err) {
-    console.error('Error reading shipsData from Blob storage:', err);
+    console.error('Error initializing database:', err);
+    process.exit(1); // Exit if database cannot be initialized
   }
 }
-
-// Call loadShipsData at startup
-loadShipsData();
 
 // WebSocket connection to AIS stream
 function connectAISStream() {
@@ -78,48 +83,20 @@ function connectAISStream() {
 
   ws.onmessage = (message) => {
     const data = JSON.parse(message.data.toString());
-    console.log('Message received from AIS stream:', data);
-    
+
     if (data.Message && data.Message.PositionReport) {
+      const mmsi = data.MetaData.MMSI_String;
       const shipData = {
-        mmsi: data.MetaData.MMSI_String,
+        mmsi: mmsi,
         lat: data.Message.PositionReport.Latitude,
         lon: data.Message.PositionReport.Longitude,
         speed: data.Message.PositionReport.Sog || 0,
         course: data.Message.PositionReport.Cog || 0,
-        timestamp: data.MetaData.time_utc,  // Added timestamp
+        timestamp: new Date(data.MetaData.time_utc),
       };
 
-      // Update existing ship data or add new ship data
-      const existingIndex = shipsData.findIndex((ship) => ship.mmsi === shipData.mmsi);
-      if (existingIndex !== -1) {
-        shipsData[existingIndex] = { ...shipsData[existingIndex], ...shipData }; // Update ship
-      } else {
-        shipsData.push(shipData);  // Add new ship
-      }
-
-      // Write shipsData to Blob storage
-      (async () => {
-        try {
-          const response = await fetch('https://blob.vercel-storage.com/shipsData.json', {
-            method: 'PUT',
-            headers: {
-              'Authorization': `Bearer ${process.env.VERCEL_BLOB_READ_WRITE_TOKEN}`,
-              'Content-Type': 'application/json',
-              'x-vercel-blob-access': 'public',
-            },
-            body: JSON.stringify(shipsData),
-          });
-
-          if (response.ok) {
-            console.log('shipsData updated in Blob storage');
-          } else {
-            throw new Error(`Failed to update shipsData.json: ${response.statusText}`);
-          }
-        } catch (err) {
-          console.error('Error writing shipsData to Blob storage:', err);
-        }
-      })();
+      // Update in-memory cache
+      shipDataCache.set(mmsi, shipData);
     }
   };
 
@@ -135,8 +112,65 @@ function connectAISStream() {
   };
 }
 
-// Initial WebSocket connection
-connectAISStream();
+// Function to batch insert/update ship data
+async function flushShipDataCache() {
+  if (shipDataCache.size === 0) return;
+
+  const shipsToUpdate = Array.from(shipDataCache.values());
+  shipDataCache.clear();
+
+  const mmsis = shipsToUpdate.map((ship) => ship.mmsi);
+  const lats = shipsToUpdate.map((ship) => ship.lat);
+  const lons = shipsToUpdate.map((ship) => ship.lon);
+  const speeds = shipsToUpdate.map((ship) => ship.speed);
+  const courses = shipsToUpdate.map((ship) => ship.course);
+  const timestamps = shipsToUpdate.map((ship) => ship.timestamp);
+
+  try {
+    await sql`
+      INSERT INTO ships (mmsi, lat, lon, speed, course, timestamp)
+      SELECT
+        UNNEST(${mmsis}::varchar[]),
+        UNNEST(${lats}::numeric[]),
+        UNNEST(${lons}::numeric[]),
+        UNNEST(${speeds}::real[]),
+        UNNEST(${courses}::real[]),
+        UNNEST(${timestamps}::timestamp[])
+      ON CONFLICT (mmsi)
+      DO UPDATE SET
+        lat = EXCLUDED.lat,
+        lon = EXCLUDED.lon,
+        speed = EXCLUDED.speed,
+        course = EXCLUDED.course,
+        timestamp = EXCLUDED.timestamp
+    `;
+    console.log(`Batch updated ${shipsToUpdate.length} ships.`);
+  } catch (err) {
+    console.error('Error batch updating ship data:', err);
+  }
+}
+
+// Flush cache every 5 minutes
+setInterval(flushShipDataCache, 300000);
+
+// Function to delete records older than 24 hours
+async function deleteOldRecords() {
+  try {
+    const thresholdDate = new Date();
+    thresholdDate.setDate(thresholdDate.getDate() - 1); // 24 hours ago
+
+    await sql`
+      DELETE FROM ships
+      WHERE timestamp < ${thresholdDate}
+    `;
+    console.log('Deleted records older than 24 hours.');
+  } catch (err) {
+    console.error('Error deleting old records:', err);
+  }
+}
+
+// Run cleanup every hour
+setInterval(deleteOldRecords, 3600000);
 
 // API endpoint to serve ship data to external services with query parameters
 app.get('/api/ships', async (req, res) => {
@@ -157,84 +191,110 @@ app.get('/api/ships', async (req, res) => {
     limit = 100,
   } = req.query;
 
-  // Load data if necessary
-  if (!shipsData.length) {
-    await loadShipsData();
-  }
+  const conditions = [];
+  const values = [];
 
-  let filteredData = shipsData;
-
-  // Filter by MMSI
   if (mmsi) {
-    filteredData = filteredData.filter(ship => ship.mmsi.toString() === mmsi);
+    conditions.push(`mmsi = $${values.length + 1}`);
+    values.push(mmsi);
+  }
+  if (latMin) {
+    conditions.push(`lat >= $${values.length + 1}`);
+    values.push(parseFloat(latMin));
+  }
+  if (latMax) {
+    conditions.push(`lat <= $${values.length + 1}`);
+    values.push(parseFloat(latMax));
+  }
+  if (lonMin) {
+    conditions.push(`lon >= $${values.length + 1}`);
+    values.push(parseFloat(lonMin));
+  }
+  if (lonMax) {
+    conditions.push(`lon <= $${values.length + 1}`);
+    values.push(parseFloat(lonMax));
+  }
+  if (speedMin) {
+    conditions.push(`speed >= $${values.length + 1}`);
+    values.push(parseFloat(speedMin));
+  }
+  if (speedMax) {
+    conditions.push(`speed <= $${values.length + 1}`);
+    values.push(parseFloat(speedMax));
+  }
+  if (courseMin) {
+    conditions.push(`course >= $${values.length + 1}`);
+    values.push(parseFloat(courseMin));
+  }
+  if (courseMax) {
+    conditions.push(`course <= $${values.length + 1}`);
+    values.push(parseFloat(courseMax));
+  }
+  if (timestampMin) {
+    conditions.push(`timestamp >= $${values.length + 1}`);
+    values.push(new Date(timestampMin));
+  }
+  if (timestampMax) {
+    conditions.push(`timestamp <= $${values.length + 1}`);
+    values.push(new Date(timestampMax));
   }
 
-  // Filter by geographical area
-  if (latMin && latMax && lonMin && lonMax) {
-    filteredData = filteredData.filter(ship => {
-      return (
-        ship.lat >= parseFloat(latMin) &&
-        ship.lat <= parseFloat(latMax) &&
-        ship.lon >= parseFloat(lonMin) &&
-        ship.lon <= parseFloat(lonMax)
-      );
-    });
+  const offset = (page - 1) * limit;
+  const limitValue = parseInt(limit);
+  const offsetValue = parseInt(offset);
+
+  let whereClause = '';
+  if (conditions.length > 0) {
+    whereClause = 'WHERE ' + conditions.join(' AND ');
   }
 
-  // Filter by speed range
-  if (speedMin && speedMax) {
-    filteredData = filteredData.filter(ship => {
-      return (
-        ship.speed >= parseFloat(speedMin) &&
-        ship.speed <= parseFloat(speedMax)
-      );
-    });
+  const queryText = `
+    SELECT * FROM ships
+    ${whereClause}
+    ORDER BY mmsi
+    LIMIT $${values.length + 1} OFFSET $${values.length + 2}
+  `;
+  values.push(limitValue, offsetValue);
+
+  try {
+    const result = await sql.query(queryText, values);
+
+    const totalResults = result.rowCount;
+
+    const responsePayload = {
+      data: result.rows,
+      isConnected: connectionState.isConnected,
+      lastConnectionTimestamp: connectionState.lastConnectionTimestamp,
+      totalResults: totalResults,
+      currentPage: parseInt(page),
+      totalPages: Math.ceil(totalResults / limit),
+    };
+
+    res.status(200).json(responsePayload);
+  } catch (err) {
+    console.error('Error querying ships data:', err);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
-
-  // Filter by course range
-  if (courseMin && courseMax) {
-    filteredData = filteredData.filter(ship => {
-      return (
-        ship.course >= parseFloat(courseMin) &&
-        ship.course <= parseFloat(courseMax)
-      );
-    });
-  }
-
-  // Filter by timestamp range
-  if (timestampMin && timestampMax) {
-    const timestampMinDate = new Date(timestampMin);
-    const timestampMaxDate = new Date(timestampMax);
-    filteredData = filteredData.filter(ship => {
-      const shipTimestamp = new Date(ship.timestamp);
-      return (
-        shipTimestamp >= timestampMinDate &&
-        shipTimestamp <= timestampMaxDate
-      );
-    });
-  }
-
-  // Implement pagination
-  const pageInt = parseInt(page);
-  const limitInt = parseInt(limit);
-  const startIndex = (pageInt - 1) * limitInt;
-  const endIndex = pageInt * limitInt;
-  const paginatedData = filteredData.slice(startIndex, endIndex);
-
-  // Prepare the response
-  const responsePayload = {
-    data: paginatedData,
-    isConnected: connectionState.isConnected,
-    lastConnectionTimestamp: connectionState.lastConnectionTimestamp,
-    totalResults: filteredData.length,
-    currentPage: pageInt,
-    totalPages: Math.ceil(filteredData.length / limitInt),
-  };
-
-  res.status(200).json(responsePayload);
 });
 
-// Start the Express server
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
+// Start the server and initialize connections
+(async () => {
+  await initializeDatabase();
+  app.listen(PORT, () => {
+    console.log(`Server running on port ${PORT}`);
+  });
+  connectAISStream();
+})();
+
+// Handle application shutdown
+process.on('exit', async () => {
+  await flushShipDataCache();
+  console.log('Flushed ship data cache on exit.');
+});
+
+process.on('SIGINT', () => process.exit());
+process.on('SIGTERM', () => process.exit());
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught Exception:', err);
+  process.exit(1);
 });
